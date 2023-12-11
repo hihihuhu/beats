@@ -80,6 +80,11 @@ func (a *azureInput) runWithEPH() error {
 				onEventErr = errors.New("OnEvent function returned false. Stopping input worker")
 				a.log.Error(onEventErr.Error())
 				a.Stop()
+				// something serious wrong happened, just panic here and let k8s restart the process
+				// this is likely a bug in the azure-event-hubs-go, where the error is ignored when close the scheduler
+				// https://github.com/Azure/azure-event-hubs-go/blob/v3.3.18/eph/scheduler.go#L193
+				// thus lead to half closed processor
+				panic(onEventErr)
 			}
 			return onEventErr
 		})
