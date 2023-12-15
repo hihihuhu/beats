@@ -10,6 +10,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"time"
+	_ "unsafe"
 
 	eventhub "github.com/Azure/azure-event-hubs-go/v3"
 	"github.com/Azure/azure-event-hubs-go/v3/eph"
@@ -70,6 +72,7 @@ func (a *azureInput) runWithEPH() error {
 		return err
 	}
 
+	watcherCtx, cancelWatcher := context.WithCancel(a.workerCtx)
 	// register a message handler -- many can be registered
 	handlerID, err := a.processor.RegisterHandler(a.workerCtx,
 		func(c context.Context, e *eventhub.Event) error {
@@ -84,6 +87,7 @@ func (a *azureInput) runWithEPH() error {
 				// this is likely a bug in the azure-event-hubs-go, where the error is ignored when close the scheduler
 				// https://github.com/Azure/azure-event-hubs-go/blob/v3.3.18/eph/scheduler.go#L193
 				// thus lead to half closed processor
+				cancelWatcher()
 				panic(onEventErr)
 			}
 			return onEventErr
@@ -102,6 +106,58 @@ func (a *azureInput) runWithEPH() error {
 		a.log.Errorw("error starting the processor", "error", err)
 		return err
 	}
+
+	lf, err := NewLeaseFixer(cred, a.config.SAName, a.config.SAContainer, env, a.processor)
+	if err != nil {
+		a.log.Errorw("error creating lease fixer", "error", err)
+		return err
+	}
+
+	// temporary workaround
+	// there is probaby some nasty bug in the azure-event-hubs-go sdk
+	// where the consumption stops but lease keep renewing
+	// so crash the process if the process doesn't do anything in 1 minute
+	go func() {
+		zeroCount := 0
+		for {
+			select {
+			case <-watcherCtx.Done():
+				return
+			default:
+				if len(a.processor.PartitionIDsBeingProcessed()) == 0 {
+					zeroCount++
+				} else {
+					// clear the counter if there is any activity
+					zeroCount = 0
+				}
+				if zeroCount > 60 {
+					a.log.Errorw("process is idle for a while")
+					// if one process is idle for a while, then it will check for stale leases
+					leases, err := lf.GetLeases(watcherCtx)
+					if err != nil {
+						a.log.Errorw("error getting leases", "error", err)
+					} else {
+						var lastErr error
+						for _, lease := range leases {
+							// the checkpoint is not updated for a while, likely hits the bug
+							if lease.Checkpoint.EnqueueTime.Before(time.Now().Add(-30 * time.Minute)) {
+								a.log.Errorw("lease is stale, deleting", "lease", lease, "checkpoint", lease.Checkpoint)
+								if err = lf.ReleaseLease(watcherCtx, lease); err != nil {
+									a.log.Errorw("error deleting lease", "error", err)
+									lastErr = err
+								}
+							}
+						}
+						if lastErr == nil {
+							// reset the counter if no error, so that it won't repeatly check for stale leases
+							zeroCount = 0
+						}
+					}
+				}
+				time.Sleep(1 * time.Second)
+			}
+		}
+	}()
 
 	return nil
 }
