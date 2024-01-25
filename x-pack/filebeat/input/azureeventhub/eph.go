@@ -10,6 +10,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math/rand"
 	"time"
 	_ "unsafe"
 
@@ -118,48 +119,38 @@ func (a *azureInput) runWithEPH() error {
 	// where the consumption stops but lease keep renewing
 	// so crash the process if the process doesn't do anything in 1 minute
 	go func() {
-		zeroCount := 0
 		for {
 			select {
 			case <-watcherCtx.Done():
 				return
 			default:
-				if len(a.processor.PartitionIDsBeingProcessed()) == 0 {
-					zeroCount++
+				a.log.Errorw("scan for stale leases")
+				leases, err := lf.GetLeases(watcherCtx)
+				if err != nil {
+					a.log.Errorw("error getting leases", "error", err)
 				} else {
-					// clear the counter if there is any activity
-					zeroCount = 0
-				}
-				if zeroCount > 60 {
-					a.log.Errorw("process is idle for a while")
-					// if one process is idle for a while, then it will check for stale leases
-					leases, err := lf.GetLeases(watcherCtx)
-					if err != nil {
-						a.log.Errorw("error getting leases", "error", err)
-					} else {
-						var lastErr error
-						for _, lease := range leases {
-							// the checkpoint is not updated for a while, likely hits the bug
-							if lease.Checkpoint.EnqueueTime.Before(time.Now().Add(-30 * time.Minute)) {
-								a.log.Errorw("lease is stale, deleting", "lease", lease, "checkpoint", lease.Checkpoint)
-								if err = lf.ReleaseLease(watcherCtx, lease); err != nil {
-									a.log.Errorw("error deleting lease", "error", err)
-									lastErr = err
-								}
+					for _, lease := range leases {
+						// the checkpoint is not updated for a while, likely hits the bug
+						if lease.Checkpoint.EnqueueTime.Before(time.Now().Add(-30 * time.Minute)) {
+							a.log.Errorw("lease is stale, deleting", "lease", lease, "checkpoint", lease.Checkpoint)
+							if err = lf.ReleaseLease(watcherCtx, lease); err != nil {
+								a.log.Errorw("error deleting lease", "error", err)
 							}
-						}
-						if lastErr == nil {
-							// reset the counter if no error, so that it won't repeatly check for stale leases
-							zeroCount = 0
 						}
 					}
 				}
-				time.Sleep(1 * time.Second)
+				sleepTime := sleepTime()
+				time.Sleep(sleepTime)
 			}
 		}
 	}()
 
 	return nil
+}
+
+func sleepTime() time.Duration {
+	// sleep for 25-30 minute
+	return 25*time.Minute + time.Duration(rand.Intn(300))*time.Second
 }
 
 func getAzureEnvironment(overrideResManager string) (azure.Environment, error) {
